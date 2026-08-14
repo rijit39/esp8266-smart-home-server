@@ -1,8 +1,18 @@
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 
 app = Flask(__name__)
+
+# ==========================================================
+# SERVER INFORMATION
+# ==========================================================
+
+SERVER_NAME = "ESP Smart Home Cloud Server"
+VERSION = "2.0"
+
+# Device considered offline after this many seconds
+OFFLINE_TIMEOUT = 30
 
 # ==========================================================
 # DEVICE DATABASE
@@ -18,37 +28,115 @@ commands = {}
 
 
 # ==========================================================
+# CURRENT TIME
+# ==========================================================
+
+def current_time():
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+# ==========================================================
+# UPDATE ONLINE STATUS
+# ==========================================================
+
+def update_online_status():
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    for device_id, device in devices.items():
+
+        last_seen = device.get(
+            "last_seen"
+        )
+
+        if not last_seen:
+            device["online"] = False
+            continue
+
+        try:
+
+            last_time = datetime.fromisoformat(
+                last_seen
+            )
+
+            difference = (
+                now - last_time
+            ).total_seconds()
+
+            if difference > OFFLINE_TIMEOUT:
+
+                device["online"] = False
+
+        except Exception:
+
+            device["online"] = False
+
+
+# ==========================================================
 # HOME
 # ==========================================================
 
 @app.route("/")
 def home():
 
-    return "ESP8266 Smart Home Server is running!"
+    return jsonify({
+
+        "success": True,
+
+        "server":
+            SERVER_NAME,
+
+        "status":
+            "online",
+
+        "version":
+            VERSION
+
+    })
 
 
 # ==========================================================
 # SERVER STATUS
 # ==========================================================
 
-@app.route("/status", methods=["GET"])
+@app.route(
+    "/status",
+    methods=["GET"]
+)
 def status():
+
+    update_online_status()
+
+    online_count = sum(
+        1
+        for device in devices.values()
+        if device.get("online")
+    )
 
     return jsonify({
 
-        "success": True,
+        "success":
+            True,
 
         "server":
-            "ESP Smart Home Cloud Server",
+            SERVER_NAME,
 
         "status":
             "online",
 
         "version":
-            "1.0",
+            VERSION,
 
         "device_count":
-            len(devices)
+            len(devices),
+
+        "online_devices":
+            online_count
 
     })
 
@@ -57,7 +145,10 @@ def status():
 # REGISTER DEVICE
 # ==========================================================
 
-@app.route("/register", methods=["POST"])
+@app.route(
+    "/register",
+    methods=["POST"]
+)
 def register():
 
     data = request.get_json(
@@ -68,7 +159,8 @@ def register():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "No JSON data received"
@@ -85,7 +177,8 @@ def register():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "device_id is required"
@@ -93,39 +186,78 @@ def register():
         }), 400
 
 
-    devices[device_id] = {
+    # ------------------------------------------------------
+    # Create or update device
+    # ------------------------------------------------------
 
-        "device_id":
-            device_id,
+    if device_id not in devices:
 
-        "type":
+        devices[device_id] = {
+
+            "device_id":
+                device_id,
+
+            "type":
+                data.get(
+                    "type",
+                    "ESP8266"
+                ),
+
+            "ip":
+                data.get(
+                    "ip",
+                    "unknown"
+                ),
+
+            "firmware":
+                data.get(
+                    "firmware",
+                    "1.0"
+                ),
+
+            "online":
+                True,
+
+            "last_seen":
+                current_time(),
+
+            "light":
+                False,
+
+            "fan":
+                False
+
+        }
+
+    else:
+
+        devices[device_id]["type"] = \
             data.get(
                 "type",
-                "unknown"
-            ),
+                devices[device_id]["type"]
+            )
 
-        "ip":
+        devices[device_id]["ip"] = \
             data.get(
                 "ip",
-                "unknown"
-            ),
+                devices[device_id]["ip"]
+            )
 
-        "firmware":
+        devices[device_id]["firmware"] = \
             data.get(
                 "firmware",
-                "unknown"
-            ),
+                devices[device_id]["firmware"]
+            )
 
-        "online":
-            True,
+        devices[device_id]["online"] = True
 
-        "last_seen":
-            datetime.now().isoformat()
-
-    }
+        devices[device_id]["last_seen"] = \
+            current_time()
 
 
-    # Make sure device starts with no command
+    # ------------------------------------------------------
+    # Create command queue
+    # ------------------------------------------------------
 
     if device_id not in commands:
 
@@ -150,7 +282,10 @@ def register():
 # HEARTBEAT
 # ==========================================================
 
-@app.route("/heartbeat", methods=["POST"])
+@app.route(
+    "/heartbeat",
+    methods=["POST"]
+)
 def heartbeat():
 
     data = request.get_json(
@@ -189,6 +324,10 @@ def heartbeat():
         }), 400
 
 
+    # ------------------------------------------------------
+    # Automatically create unknown device
+    # ------------------------------------------------------
+
     if device_id not in devices:
 
         devices[device_id] = {
@@ -218,22 +357,62 @@ def heartbeat():
                 True,
 
             "last_seen":
-                datetime.now().isoformat()
+                current_time(),
+
+            "light":
+                False,
+
+            "fan":
+                False
 
         }
 
+
+        commands[device_id] = None
+
+
     else:
 
-        devices[device_id]["online"] = True
+        device = devices[device_id]
 
-        devices[device_id]["last_seen"] = \
-            datetime.now().isoformat()
+        device["online"] = True
+
+        device["last_seen"] = \
+            current_time()
 
 
         if "ip" in data:
 
-            devices[device_id]["ip"] = \
+            device["ip"] = \
                 data["ip"]
+
+
+        if "type" in data:
+
+            device["type"] = \
+                data["type"]
+
+
+        if "firmware" in data:
+
+            device["firmware"] = \
+                data["firmware"]
+
+
+        # --------------------------------------------------
+        # Receive actual relay states from ESP
+        # --------------------------------------------------
+
+        if "light" in data:
+
+            device["light"] = \
+                bool(data["light"])
+
+
+        if "fan" in data:
+
+            device["fan"] = \
+                bool(data["fan"])
 
 
     return jsonify({
@@ -245,7 +424,10 @@ def heartbeat():
             "Heartbeat received",
 
         "device_id":
-            device_id
+            device_id,
+
+        "online":
+            True
 
     })
 
@@ -254,8 +436,13 @@ def heartbeat():
 # GET ALL DEVICES
 # ==========================================================
 
-@app.route("/devices", methods=["GET"])
+@app.route(
+    "/devices",
+    methods=["GET"]
+)
 def get_devices():
+
+    update_online_status()
 
     return jsonify({
 
@@ -283,6 +470,9 @@ def get_devices():
 )
 def get_device(device_id):
 
+    update_online_status()
+
+
     if device_id not in devices:
 
         return jsonify({
@@ -308,7 +498,7 @@ def get_device(device_id):
 
 
 # ==========================================================
-# SEND COMMAND TO DEVICE
+# SEND COMMAND FROM APP
 # ==========================================================
 
 @app.route(
@@ -370,6 +560,10 @@ def send_command():
         }), 400
 
 
+    # ------------------------------------------------------
+    # Allowed commands
+    # ------------------------------------------------------
+
     allowed_commands = [
 
         "LIGHT_ON",
@@ -393,6 +587,10 @@ def send_command():
         }), 400
 
 
+    # ------------------------------------------------------
+    # Device must exist
+    # ------------------------------------------------------
+
     if device_id not in devices:
 
         return jsonify({
@@ -406,7 +604,9 @@ def send_command():
         }), 404
 
 
-    # Store command
+    # ------------------------------------------------------
+    # Put command into this device's queue
+    # ------------------------------------------------------
 
     commands[device_id] = command
 
@@ -429,7 +629,7 @@ def send_command():
 
 
 # ==========================================================
-# ESP8266 CHECKS FOR COMMAND
+# ESP CHECKS FOR COMMAND
 # ==========================================================
 
 @app.route(
@@ -474,7 +674,9 @@ def get_command():
     )
 
 
+    # ------------------------------------------------------
     # No command waiting
+    # ------------------------------------------------------
 
     if command is None:
 
@@ -492,12 +694,16 @@ def get_command():
         })
 
 
-    # Save command temporarily
+    # ------------------------------------------------------
+    # Save command
+    # ------------------------------------------------------
 
     current_command = command
 
 
-    # Clear command after delivering it
+    # ------------------------------------------------------
+    # Remove command from queue
+    # ------------------------------------------------------
 
     commands[device_id] = None
 
@@ -512,6 +718,153 @@ def get_command():
 
         "command":
             current_command
+
+    })
+
+
+# ==========================================================
+# UPDATE DEVICE STATE
+# ==========================================================
+
+@app.route(
+    "/state",
+    methods=["POST"]
+)
+def update_state():
+
+    data = request.get_json(
+        silent=True
+    )
+
+
+    if not data:
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "message":
+                "No JSON data received"
+
+        }), 400
+
+
+    device_id = data.get(
+        "device_id"
+    )
+
+
+    if not device_id:
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "message":
+                "device_id is required"
+
+        }), 400
+
+
+    if device_id not in devices:
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "message":
+                "Device not found"
+
+        }), 404
+
+
+    device = devices[device_id]
+
+
+    # ------------------------------------------------------
+    # Update light state
+    # ------------------------------------------------------
+
+    if "light" in data:
+
+        device["light"] = \
+            bool(data["light"])
+
+
+    # ------------------------------------------------------
+    # Update fan state
+    # ------------------------------------------------------
+
+    if "fan" in data:
+
+        device["fan"] = \
+            bool(data["fan"])
+
+
+    device["online"] = True
+
+    device["last_seen"] = \
+        current_time()
+
+
+    return jsonify({
+
+        "success":
+            True,
+
+        "message":
+            "Device state updated",
+
+        "device":
+            device
+
+    })
+
+
+# ==========================================================
+# REMOVE DEVICE
+# ==========================================================
+
+@app.route(
+    "/device/<device_id>",
+    methods=["DELETE"]
+)
+def delete_device(device_id):
+
+    if device_id not in devices:
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "message":
+                "Device not found"
+
+        }), 404
+
+
+    del devices[device_id]
+
+
+    if device_id in commands:
+
+        del commands[device_id]
+
+
+    return jsonify({
+
+        "success":
+            True,
+
+        "message":
+            "Device removed",
+
+        "device_id":
+            device_id
 
     })
 
