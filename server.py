@@ -3,172 +3,168 @@ from datetime import datetime, timezone
 import os
 import threading
 
+
 app = Flask(__name__)
 
 
 # ==========================================================
-# SERVER VERSION
+# SERVER
 # ==========================================================
 
-SERVER_VERSION = "2.2"
-
-
-# ==========================================================
-# DEVICE OFFLINE TIMEOUT
-# ==========================================================
+SERVER_VERSION = "3.0"
 
 OFFLINE_TIMEOUT_SECONDS = 30
-
-
-# ==========================================================
-# COMMAND TIMEOUT
-#
-# A command that is not confirmed within this time is removed.
-# This prevents old commands from remaining forever.
-# ==========================================================
-
 COMMAND_TIMEOUT_SECONDS = 15
 
 
 # ==========================================================
-# DEVICE DATABASE
+# DATABASE
 # ==========================================================
 
 devices = {}
 
-
-# ==========================================================
-# COMMAND QUEUE
-#
-# Structure:
+# Command queue:
 #
 # commands = {
-#
-#   "ESP8266-123456": {
-#
-#       "LIGHT": {
-#           "command": "LIGHT_ON",
-#           "created": "...",
-#           "delivered": False
-#       },
-#
-#       "FAN": {
-#           "command": "FAN_ON",
-#           "created": "...",
-#           "delivered": False
-#       }
-#   }
+#     "ESP8266-123456": {
+#         "relay_1": {
+#             "command": "RELAY_ON",
+#             "created": "...",
+#             "delivered": False
+#         }
+#     }
 # }
-#
-# Light and Fan now have separate command slots.
-# ==========================================================
 
 commands = {}
 
 
 # ==========================================================
 # THREAD LOCK
-#
-# Protects the dictionaries from simultaneous requests.
 # ==========================================================
 
 data_lock = threading.RLock()
 
 
 # ==========================================================
-# CURRENT UTC TIME
+# TIME
 # ==========================================================
 
 def current_datetime():
-
     return datetime.now(timezone.utc)
 
 
 def current_time():
-
     return current_datetime().isoformat()
 
 
 # ==========================================================
-# COMMAND TYPE
-# ==========================================================
-
-def command_type(command):
-
-    if command.startswith("LIGHT_"):
-        return "LIGHT"
-
-    if command.startswith("FAN_"):
-        return "FAN"
-
-    return None
-
-
-# ==========================================================
-# CREATE COMMAND STORAGE FOR DEVICE
+# DEVICE COMMAND STORAGE
 # ==========================================================
 
 def ensure_command_storage(device_id):
 
     if device_id not in commands:
+        commands[device_id] = {}
 
-        commands[device_id] = {
-
-            "LIGHT": None,
-
-            "FAN": None
-        }
-
-
-# ==========================================================
-# CLEAR ALL COMMANDS FOR DEVICE
-# ==========================================================
 
 def clear_device_commands(device_id):
 
     ensure_command_storage(device_id)
 
-    commands[device_id]["LIGHT"] = None
-    commands[device_id]["FAN"] = None
+    commands[device_id].clear()
 
 
 # ==========================================================
-# CLEAN EXPIRED COMMANDS
+# COMMAND CONTROL NAME
+# ==========================================================
+
+def get_control_from_command(command, data=None):
+
+    data = data or {}
+
+    # ------------------------------------------------------
+    # NEW GENERIC RELAY COMMAND
+    # ------------------------------------------------------
+
+    if command in ["RELAY_ON", "RELAY_OFF"]:
+
+        relay_id = data.get("relay")
+
+        if relay_id is None:
+            relay_id = data.get("channel")
+
+        if relay_id is None:
+            relay_id = 1
+
+        return "relay_" + str(relay_id)
+
+
+    # ------------------------------------------------------
+    # OLD COMMANDS
+    # ------------------------------------------------------
+
+    if command.startswith("LIGHT_"):
+        return "light"
+
+    if command.startswith("FAN_"):
+        return "fan"
+
+
+    return None
+
+
+# ==========================================================
+# COMMAND TIMEOUT CLEANUP
 # ==========================================================
 
 def cleanup_commands(device_id=None):
 
     now = current_datetime()
 
-    device_ids = (
+    if device_id is not None:
+        device_ids = [device_id]
+    else:
+        device_ids = list(commands.keys())
 
-        [device_id]
-        if device_id is not None
-        else list(commands.keys())
-    )
 
     for current_device_id in device_ids:
 
         ensure_command_storage(current_device_id)
 
-        for control in ["LIGHT", "FAN"]:
+        controls = list(
+            commands[current_device_id].keys()
+        )
 
-            item = commands[current_device_id][control]
+
+        for control in controls:
+
+            item = commands[
+                current_device_id
+            ].get(control)
+
 
             if item is None:
                 continue
+
 
             try:
 
                 created_text = item.get("created")
 
+
                 if not created_text:
-                    commands[current_device_id][control] = None
+
+                    commands[
+                        current_device_id
+                    ].pop(control, None)
+
                     continue
+
 
                 created = datetime.fromisoformat(
                     created_text
                 )
+
 
                 if created.tzinfo is None:
 
@@ -176,9 +172,11 @@ def cleanup_commands(device_id=None):
                         tzinfo=timezone.utc
                     )
 
+
                 age = (
                     now - created
                 ).total_seconds()
+
 
                 if age > COMMAND_TIMEOUT_SECONDS:
 
@@ -189,9 +187,11 @@ def cleanup_commands(device_id=None):
                         item.get("command")
                     )
 
+
                     commands[
                         current_device_id
-                    ][control] = None
+                    ].pop(control, None)
+
 
             except Exception as e:
 
@@ -200,13 +200,14 @@ def cleanup_commands(device_id=None):
                     e
                 )
 
+
                 commands[
                     current_device_id
-                ][control] = None
+                ].pop(control, None)
 
 
 # ==========================================================
-# UPDATE DEVICE ONLINE STATUS
+# ONLINE STATUS
 # ==========================================================
 
 def update_online_status(device):
@@ -216,6 +217,7 @@ def update_online_status(device):
         last_seen_text = device.get(
             "last_seen"
         )
+
 
         if not last_seen_text:
 
@@ -245,15 +247,18 @@ def update_online_status(device):
 
             device["online"] = False
 
+
             device_id = device.get(
                 "device_id"
             )
+
 
             if device_id:
 
                 clear_device_commands(
                     device_id
                 )
+
 
             return False
 
@@ -270,13 +275,14 @@ def update_online_status(device):
             e
         )
 
+
         device["online"] = False
 
         return False
 
 
 # ==========================================================
-# UPDATE ALL DEVICE STATUSES
+# UPDATE ALL ONLINE STATUS
 # ==========================================================
 
 def update_all_online_status():
@@ -289,19 +295,209 @@ def update_all_online_status():
                 device
             )
 
+
         cleanup_commands()
 
 
 # ==========================================================
-# CONFIRM COMMANDS USING HEARTBEAT
-#
-# If ESP reports the desired state, remove that command.
+# NORMALIZE RELAYS
+# ==========================================================
+
+def normalize_relays(data):
+
+    relays = data.get("relays")
+
+
+    # ------------------------------------------------------
+    # NEW FORMAT
+    # ------------------------------------------------------
+
+    if isinstance(relays, list):
+
+        result = []
+
+
+        for index, relay in enumerate(
+            relays,
+            start=1
+        ):
+
+            if isinstance(relay, dict):
+
+                relay_id = relay.get(
+                    "id",
+                    index
+                )
+
+                name = relay.get(
+                    "name",
+                    "Relay " + str(relay_id)
+                )
+
+                state = bool(
+                    relay.get(
+                        "state",
+                        False
+                    )
+                )
+
+            else:
+
+                relay_id = index
+
+                name = (
+                    "Relay " +
+                    str(relay_id)
+                )
+
+                state = bool(relay)
+
+
+            result.append({
+
+                "id": relay_id,
+
+                "name": name,
+
+                "state": state
+
+            })
+
+
+        return result
+
+
+    # ------------------------------------------------------
+    # CURRENT 2-RELAY SYSTEM
+    # ------------------------------------------------------
+
+    return [
+
+        {
+            "id": 1,
+            "name": "Light",
+            "state": bool(
+                data.get(
+                    "light",
+                    False
+                )
+            )
+        },
+
+        {
+            "id": 2,
+            "name": "Fan",
+            "state": bool(
+                data.get(
+                    "fan",
+                    False
+                )
+            )
+        }
+
+    ]
+
+
+# ==========================================================
+# UPDATE RELAY STATE
+# ==========================================================
+
+def update_relay_state(
+    device,
+    relay_id,
+    state
+):
+
+    relays = device.setdefault(
+        "relays",
+        []
+    )
+
+
+    found = False
+
+
+    for relay in relays:
+
+        if str(relay.get("id")) == str(
+            relay_id
+        ):
+
+            relay["state"] = bool(state)
+
+            found = True
+
+            break
+
+
+    if not found:
+
+        relays.append({
+
+            "id": relay_id,
+
+            "name":
+                "Relay " +
+                str(relay_id),
+
+            "state": bool(state)
+
+        })
+
+
+    # ------------------------------------------------------
+    # BACKWARD COMPATIBILITY
+    # ------------------------------------------------------
+
+    if str(relay_id) == "1":
+
+        device["light"] = bool(state)
+
+
+    if str(relay_id) == "2":
+
+        device["fan"] = bool(state)
+
+
+# ==========================================================
+# FIND RELAY
+# ==========================================================
+
+def get_relay_state(
+    device,
+    relay_id
+):
+
+    relays = device.get(
+        "relays",
+        []
+    )
+
+
+    for relay in relays:
+
+        if str(
+            relay.get("id")
+        ) == str(relay_id):
+
+            return bool(
+                relay.get(
+                    "state",
+                    False
+                )
+            )
+
+
+    return False
+
+
+# ==========================================================
+# CONFIRM COMMAND FROM DEVICE STATE
 # ==========================================================
 
 def confirm_commands_from_state(
     device_id,
-    light_state,
-    fan_state
+    device
 ):
 
     ensure_command_storage(
@@ -309,106 +505,365 @@ def confirm_commands_from_state(
     )
 
 
-    # ------------------------------------------------------
-    # LIGHT
-    # ------------------------------------------------------
-
-    light_command = commands[
-        device_id
-    ]["LIGHT"]
+    controls = list(
+        commands[device_id].keys()
+    )
 
 
-    if light_command is not None:
+    for control in controls:
 
-        command = light_command.get(
+        item = commands[
+            device_id
+        ].get(control)
+
+
+        if item is None:
+            continue
+
+
+        command = item.get(
             "command"
         )
 
 
-        if (
-            command == "LIGHT_ON"
-            and light_state is True
+        confirmed = False
+
+
+        # --------------------------------------------------
+        # OLD LIGHT COMMAND
+        # --------------------------------------------------
+
+        if control == "light":
+
+            state = bool(
+                device.get(
+                    "light",
+                    False
+                )
+            )
+
+
+            if (
+                command == "LIGHT_ON"
+                and state
+            ):
+
+                confirmed = True
+
+
+            elif (
+                command == "LIGHT_OFF"
+                and not state
+            ):
+
+                confirmed = True
+
+
+        # --------------------------------------------------
+        # OLD FAN COMMAND
+        # --------------------------------------------------
+
+        elif control == "fan":
+
+            state = bool(
+                device.get(
+                    "fan",
+                    False
+                )
+            )
+
+
+            if (
+                command == "FAN_ON"
+                and state
+            ):
+
+                confirmed = True
+
+
+            elif (
+                command == "FAN_OFF"
+                and not state
+            ):
+
+                confirmed = True
+
+
+        # --------------------------------------------------
+        # GENERIC RELAY
+        # --------------------------------------------------
+
+        elif control.startswith(
+            "relay_"
         ):
 
-            print(
-                "Confirmed LIGHT_ON:",
-                device_id
+            relay_id = control.replace(
+                "relay_",
+                ""
             )
+
+
+            state = get_relay_state(
+                device,
+                relay_id
+            )
+
+
+            if (
+                command == "RELAY_ON"
+                and state
+            ):
+
+                confirmed = True
+
+
+            elif (
+                command == "RELAY_OFF"
+                and not state
+            ):
+
+                confirmed = True
+
+
+        # --------------------------------------------------
+        # REMOVE CONFIRMED COMMAND
+        # --------------------------------------------------
+
+        if confirmed:
+
+            print(
+                "Command confirmed:",
+                device_id,
+                control,
+                command
+            )
+
 
             commands[
                 device_id
-            ]["LIGHT"] = None
-
-
-        elif (
-            command == "LIGHT_OFF"
-            and light_state is False
-        ):
-
-            print(
-                "Confirmed LIGHT_OFF:",
-                device_id
+            ].pop(
+                control,
+                None
             )
 
-            commands[
-                device_id
-            ]["LIGHT"] = None
+
+# ==========================================================
+# CREATE / UPDATE DEVICE
+# ==========================================================
+
+def build_device(data):
+
+    relays = normalize_relays(
+        data
+    )
+
+
+    device = {
+
+        "device_id":
+            data.get(
+                "device_id"
+            ),
+
+        "type":
+            data.get(
+                "type",
+                "ESP8266"
+            ),
+
+        "ip":
+            data.get(
+                "ip",
+                "unknown"
+            ),
+
+        "firmware":
+            data.get(
+                "firmware",
+                "unknown"
+            ),
+
+        "online":
+            True,
+
+        # ----------------------------------------------
+        # BACKWARD COMPATIBLE
+        # ----------------------------------------------
+
+        "light":
+            bool(
+                data.get(
+                    "light",
+                    get_relay_state(
+                        {
+                            "relays": relays
+                        },
+                        1
+                    )
+                )
+            ),
+
+        "fan":
+            bool(
+                data.get(
+                    "fan",
+                    get_relay_state(
+                        {
+                            "relays": relays
+                        },
+                        2
+                    )
+                )
+            ),
+
+        # ----------------------------------------------
+        # GENERIC RELAYS
+        # ----------------------------------------------
+
+        "relays":
+            relays,
+
+        # ----------------------------------------------
+        # SENSORS
+        # ----------------------------------------------
+
+        "sensors":
+            data.get(
+                "sensors",
+                {}
+            ),
+
+        # ----------------------------------------------
+        # ENERGY
+        # ----------------------------------------------
+
+        "energy":
+            data.get(
+                "energy",
+                {}
+            ),
+
+        "last_seen":
+            current_time()
+    }
+
+
+    return device
+
+
+# ==========================================================
+# UPDATE DEVICE FROM ESP DATA
+# ==========================================================
+
+def update_device_from_data(
+    device,
+    data
+):
+
+    if "type" in data:
+
+        device["type"] = data[
+            "type"
+        ]
+
+
+    if "ip" in data:
+
+        device["ip"] = data[
+            "ip"
+        ]
+
+
+    if "firmware" in data:
+
+        device["firmware"] = data[
+            "firmware"
+        ]
 
 
     # ------------------------------------------------------
-    # FAN
+    # GENERIC RELAYS
     # ------------------------------------------------------
 
-    fan_command = commands[
-        device_id
-    ]["FAN"]
+    if "relays" in data:
 
-
-    if fan_command is not None:
-
-        command = fan_command.get(
-            "command"
+        device["relays"] = (
+            normalize_relays(data)
         )
 
 
-        if (
-            command == "FAN_ON"
-            and fan_state is True
-        ):
+    # ------------------------------------------------------
+    # OLD LIGHT / FAN
+    # ------------------------------------------------------
 
-            print(
-                "Confirmed FAN_ON:",
-                device_id
+    if "light" in data:
+
+        device["light"] = bool(
+            data["light"]
+        )
+
+
+        update_relay_state(
+            device,
+            1,
+            data["light"]
+        )
+
+
+    if "fan" in data:
+
+        device["fan"] = bool(
+            data["fan"]
+        )
+
+
+        update_relay_state(
+            device,
+            2,
+            data["fan"]
+        )
+
+
+    # ------------------------------------------------------
+    # SENSORS
+    # ------------------------------------------------------
+
+    if "sensors" in data:
+
+        device["sensors"] = (
+            data.get(
+                "sensors",
+                {}
             )
-
-            commands[
-                device_id
-            ]["FAN"] = None
+        )
 
 
-        elif (
-            command == "FAN_OFF"
-            and fan_state is False
-        ):
+    # ------------------------------------------------------
+    # ENERGY
+    # ------------------------------------------------------
 
-            print(
-                "Confirmed FAN_OFF:",
-                device_id
+    if "energy" in data:
+
+        device["energy"] = (
+            data.get(
+                "energy",
+                {}
             )
+        )
 
-            commands[
-                device_id
-            ]["FAN"] = None
+
+    device["online"] = True
+
+    device["last_seen"] = (
+        current_time()
+    )
 
 
 # ==========================================================
 # HOME
 # ==========================================================
 
-@app.route(
-    "/",
-    methods=["GET"]
-)
+@app.route("/", methods=["GET"])
 def home():
 
     update_all_online_status()
@@ -420,7 +875,9 @@ def home():
 
         for device in devices.values()
 
-        if device.get("online") is True
+        if device.get(
+            "online"
+        ) is True
     )
 
 
@@ -429,7 +886,7 @@ def home():
         "success": True,
 
         "server":
-            "ESP8266 Smart Home Cloud Server",
+            "ESP Smart Home Cloud Server",
 
         "version":
             SERVER_VERSION,
@@ -464,7 +921,9 @@ def status():
 
         for device in devices.values()
 
-        if device.get("online") is True
+        if device.get(
+            "online"
+        ) is True
     )
 
 
@@ -541,51 +1000,9 @@ def register():
 
         if device_id not in devices:
 
-            devices[device_id] = {
-
-                "device_id":
-                    device_id,
-
-                "type":
-                    data.get(
-                        "type",
-                        "ESP8266"
-                    ),
-
-                "ip":
-                    data.get(
-                        "ip",
-                        "unknown"
-                    ),
-
-                "firmware":
-                    data.get(
-                        "firmware",
-                        "unknown"
-                    ),
-
-                "online":
-                    True,
-
-                "light":
-                    bool(
-                        data.get(
-                            "light",
-                            False
-                        )
-                    ),
-
-                "fan":
-                    bool(
-                        data.get(
-                            "fan",
-                            False
-                        )
-                    ),
-
-                "last_seen":
-                    current_time()
-            }
+            devices[device_id] = (
+                build_device(data)
+            )
 
 
             ensure_command_storage(
@@ -609,45 +1026,9 @@ def register():
             ]
 
 
-            if "type" in data:
-
-                device["type"] = data[
-                    "type"
-                ]
-
-
-            if "ip" in data:
-
-                device["ip"] = data[
-                    "ip"
-                ]
-
-
-            if "firmware" in data:
-
-                device["firmware"] = data[
-                    "firmware"
-                ]
-
-
-            if "light" in data:
-
-                device["light"] = bool(
-                    data["light"]
-                )
-
-
-            if "fan" in data:
-
-                device["fan"] = bool(
-                    data["fan"]
-                )
-
-
-            device["online"] = True
-
-            device["last_seen"] = (
-                current_time()
+            update_device_from_data(
+                device,
+                data
             )
 
 
@@ -656,25 +1037,9 @@ def register():
             )
 
 
-            # ------------------------------------------------
-            # IMPORTANT
-            #
-            # Confirm states reported during registration.
-            # ------------------------------------------------
-
             confirm_commands_from_state(
-
                 device_id,
-
-                device.get(
-                    "light",
-                    False
-                ),
-
-                device.get(
-                    "fan",
-                    False
-                )
+                device
             )
 
 
@@ -742,59 +1107,23 @@ def heartbeat():
     with data_lock:
 
         # --------------------------------------------------
-        # UNKNOWN DEVICE
+        # AUTOMATIC REGISTRATION
         # --------------------------------------------------
 
         if device_id not in devices:
 
-            devices[device_id] = {
-
-                "device_id":
-                    device_id,
-
-                "type":
-                    data.get(
-                        "type",
-                        "ESP8266"
-                    ),
-
-                "ip":
-                    data.get(
-                        "ip",
-                        "unknown"
-                    ),
-
-                "firmware":
-                    data.get(
-                        "firmware",
-                        "unknown"
-                    ),
-
-                "online":
-                    True,
-
-                "light":
-                    bool(
-                        data.get(
-                            "light",
-                            False
-                        )
-                    ),
-
-                "fan":
-                    bool(
-                        data.get(
-                            "fan",
-                            False
-                        )
-                    ),
-
-                "last_seen":
-                    current_time()
-            }
+            devices[device_id] = (
+                build_device(data)
+            )
 
 
             ensure_command_storage(
+                device_id
+            )
+
+
+            print(
+                "Auto-registered device:",
                 device_id
             )
 
@@ -810,76 +1139,24 @@ def heartbeat():
             ]
 
 
-            device["online"] = True
-
-
-            device["last_seen"] = (
-                current_time()
+            update_device_from_data(
+                device,
+                data
             )
 
-
-            if "ip" in data:
-
-                device["ip"] = data[
-                    "ip"
-                ]
-
-
-            if "type" in data:
-
-                device["type"] = data[
-                    "type"
-                ]
-
-
-            if "firmware" in data:
-
-                device["firmware"] = data[
-                    "firmware"
-                ]
-
-
-            if "light" in data:
-
-                device["light"] = bool(
-                    data["light"]
-                )
-
-
-            if "fan" in data:
-
-                device["fan"] = bool(
-                    data["fan"]
-                )
-
-
-            ensure_command_storage(
-                device_id
-            )
-
-
-        # --------------------------------------------------
-        # CONFIRM REAL ESP STATE
-        # --------------------------------------------------
 
         device = devices[
             device_id
         ]
 
 
+        # --------------------------------------------------
+        # CONFIRM COMMANDS
+        # --------------------------------------------------
+
         confirm_commands_from_state(
-
             device_id,
-
-            device.get(
-                "light",
-                False
-            ),
-
-            device.get(
-                "fan",
-                False
-            )
+            device
         )
 
 
@@ -903,7 +1180,10 @@ def heartbeat():
             device_id,
 
         "online":
-            True
+            True,
+
+        "device":
+            device
     })
 
 
@@ -920,31 +1200,35 @@ def get_devices():
     update_all_online_status()
 
 
-    online_count = sum(
+    with data_lock:
 
-        1
+        online_count = sum(
 
-        for device in devices.values()
+            1
 
-        if device.get("online") is True
-    )
+            for device in devices.values()
+
+            if device.get(
+                "online"
+            ) is True
+        )
 
 
-    return jsonify({
+        return jsonify({
 
-        "success": True,
+            "success": True,
 
-        "count":
-            len(devices),
+            "count":
+                len(devices),
 
-        "online_devices":
-            online_count,
+            "online_devices":
+                online_count,
 
-        "devices":
-            list(
-                devices.values()
-            )
-    })
+            "devices":
+                list(
+                    devices.values()
+                )
+        })
 
 
 # ==========================================================
@@ -996,7 +1280,7 @@ def get_device(device_id):
 
 
 # ==========================================================
-# SEND COMMAND TO DEVICE
+# SEND COMMAND
 # ==========================================================
 
 @app.route(
@@ -1059,12 +1343,13 @@ def send_command():
     allowed_commands = [
 
         "LIGHT_ON",
-
         "LIGHT_OFF",
 
         "FAN_ON",
+        "FAN_OFF",
 
-        "FAN_OFF"
+        "RELAY_ON",
+        "RELAY_OFF"
     ]
 
 
@@ -1080,8 +1365,9 @@ def send_command():
         }), 400
 
 
-    control = command_type(
-        command
+    control = get_control_from_command(
+        command,
+        data
     )
 
 
@@ -1117,15 +1403,12 @@ def send_command():
 
 
         # --------------------------------------------------
-        # CHECK DEVICE ONLINE
+        # CHECK ONLINE
         # --------------------------------------------------
 
-        is_online = update_online_status(
+        if not update_online_status(
             device
-        )
-
-
-        if not is_online:
+        ):
 
             return jsonify({
 
@@ -1148,24 +1431,13 @@ def send_command():
         )
 
 
-        # --------------------------------------------------
-        # CLEAN OLD COMMANDS
-        # --------------------------------------------------
-
         cleanup_commands(
             device_id
         )
 
 
         # --------------------------------------------------
-        # STORE NEW COMMAND
-        #
-        # IMPORTANT:
-        #
-        # Only the same control is replaced.
-        #
-        # LIGHT command does NOT replace FAN command.
-        # FAN command does NOT replace LIGHT command.
+        # STORE COMMAND
         # --------------------------------------------------
 
         commands[
@@ -1213,7 +1485,7 @@ def send_command():
 
 
 # ==========================================================
-# ESP8266 CHECKS FOR COMMAND
+# ESP GET COMMAND
 # ==========================================================
 
 @app.route(
@@ -1259,15 +1531,12 @@ def get_command():
 
 
         # --------------------------------------------------
-        # CHECK ONLINE STATUS
+        # CHECK ONLINE
         # --------------------------------------------------
 
-        is_online = update_online_status(
+        if not update_online_status(
             device
-        )
-
-
-        if not is_online:
+        ):
 
             return jsonify({
 
@@ -1288,10 +1557,6 @@ def get_command():
             })
 
 
-        # --------------------------------------------------
-        # REMOVE EXPIRED COMMANDS
-        # --------------------------------------------------
-
         cleanup_commands(
             device_id
         )
@@ -1303,38 +1568,27 @@ def get_command():
 
 
         # --------------------------------------------------
-        # PRIORITY:
-        #
-        # Return Light first if available.
-        # Otherwise return Fan.
-        #
-        # The other command remains queued.
+        # FIND FIRST AVAILABLE COMMAND
         # --------------------------------------------------
 
         selected_control = None
+
         selected_item = None
 
 
-        if commands[
-            device_id
-        ]["LIGHT"] is not None:
-
-            selected_control = "LIGHT"
-
-            selected_item = commands[
+        for control, item in (
+            commands[
                 device_id
-            ]["LIGHT"]
+            ].items()
+        ):
 
+            if item is not None:
 
-        elif commands[
-            device_id
-        ]["FAN"] is not None:
+                selected_control = control
 
-            selected_control = "FAN"
+                selected_item = item
 
-            selected_item = commands[
-                device_id
-            ]["FAN"]
+                break
 
 
         # --------------------------------------------------
@@ -1359,24 +1613,19 @@ def get_command():
 
 
         # --------------------------------------------------
-        # MARK AS DELIVERED
-        #
-        # IMPORTANT:
-        #
-        # DO NOT DELETE IT YET.
-        #
-        # The heartbeat must confirm the actual
-        # relay state first.
+        # MARK DELIVERED
         # --------------------------------------------------
 
-        commands[
-            device_id
-        ][selected_control]["delivered"] = True
+        selected_item[
+            "delivered"
+        ] = True
 
 
-        current_command = selected_item[
-            "command"
-        ]
+        current_command = (
+            selected_item[
+                "command"
+            ]
+        )
 
 
         print(
@@ -1387,7 +1636,7 @@ def get_command():
         )
 
 
-        return jsonify({
+        response = {
 
             "success": True,
 
@@ -1402,13 +1651,35 @@ def get_command():
 
             "control":
                 selected_control
-        })
+        }
+
+
+        # --------------------------------------------------
+        # GENERIC RELAY ID
+        # --------------------------------------------------
+
+        if selected_control.startswith(
+            "relay_"
+        ):
+
+            relay_id = (
+                selected_control.replace(
+                    "relay_",
+                    ""
+                )
+            )
+
+
+            response[
+                "relay"
+            ] = relay_id
+
+
+        return jsonify(response)
 
 
 # ==========================================================
 # COMMAND STATUS
-#
-# Useful for debugging and future Android improvements.
 # ==========================================================
 
 @app.route(
@@ -1461,26 +1732,22 @@ def command_status():
         result = {}
 
 
-        for control in [
-            "LIGHT",
-            "FAN"
-        ]:
-
-            item = commands[
+        for control, item in (
+            commands[
                 device_id
-            ][control]
-
+            ].items()
+        ):
 
             if item is None:
 
                 result[
-                    control.lower()
+                    control
                 ] = None
 
             else:
 
                 result[
-                    control.lower()
+                    control
                 ] = {
 
                     "command":
@@ -1514,7 +1781,7 @@ def command_status():
 
 
 # ==========================================================
-# MANUALLY MARK DEVICE OFFLINE
+# MANUALLY MARK OFFLINE
 # ==========================================================
 
 @app.route(
@@ -1560,6 +1827,47 @@ def mark_offline(device_id):
 
 
 # ==========================================================
+# RESET DEVICE COMMANDS
+# ==========================================================
+
+@app.route(
+    "/device/<device_id>/clear-commands",
+    methods=["POST"]
+)
+def clear_commands(device_id):
+
+    with data_lock:
+
+        if device_id not in devices:
+
+            return jsonify({
+
+                "success": False,
+
+                "message":
+                    "Device not found"
+
+            }), 404
+
+
+        clear_device_commands(
+            device_id
+        )
+
+
+        return jsonify({
+
+            "success": True,
+
+            "message":
+                "All commands cleared",
+
+            "device_id":
+                device_id
+        })
+
+
+# ==========================================================
 # MAIN
 # ==========================================================
 
@@ -1568,9 +1876,7 @@ if __name__ == "__main__":
     port = int(
 
         os.environ.get(
-
             "PORT",
-
             5000
         )
     )
@@ -1581,11 +1887,11 @@ if __name__ == "__main__":
     )
 
     print(
-        " ESP8266 SMART HOME SERVER"
+        " ESP SMART HOME CLOUD SERVER"
     )
 
     print(
-        " VERSION 2.2"
+        " VERSION 3.0"
     )
 
     print(
