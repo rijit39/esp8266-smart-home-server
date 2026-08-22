@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os
 import threading
 
@@ -11,10 +11,13 @@ app = Flask(__name__)
 # SERVER
 # ==========================================================
 
-SERVER_VERSION = "3.0"
+SERVER_VERSION = "3.1"
 
 OFFLINE_TIMEOUT_SECONDS = 30
 COMMAND_TIMEOUT_SECONDS = 15
+
+# Keep graph data for 48 hours
+HISTORY_HOURS = 48
 
 
 # ==========================================================
@@ -23,17 +26,24 @@ COMMAND_TIMEOUT_SECONDS = 15
 
 devices = {}
 
-# Command queue:
+# Energy / sensor history
 #
-# commands = {
-#     "ESP8266-123456": {
-#         "relay_1": {
-#             "command": "RELAY_ON",
-#             "created": "...",
-#             "delivered": False
+# energy_history = {
+#     "ESP8266-123456": [
+#         {
+#             "timestamp": "...",
+#             "sensors": {...},
+#             "energy": {...}
 #         }
-#     }
+#     ]
 # }
+
+energy_history = {}
+
+
+# ==========================================================
+# COMMAND DATABASE
+# ==========================================================
 
 commands = {}
 
@@ -50,11 +60,133 @@ data_lock = threading.RLock()
 # ==========================================================
 
 def current_datetime():
+
     return datetime.now(timezone.utc)
 
 
 def current_time():
+
     return current_datetime().isoformat()
+
+
+# ==========================================================
+# HISTORY STORAGE
+# ==========================================================
+
+def ensure_history_storage(device_id):
+
+    if device_id not in energy_history:
+
+        energy_history[device_id] = []
+
+
+# ==========================================================
+# CLEAN OLD HISTORY
+# ==========================================================
+
+def cleanup_history(device_id):
+
+    ensure_history_storage(device_id)
+
+    cutoff_time = (
+        current_datetime()
+        - timedelta(hours=HISTORY_HOURS)
+    )
+
+    cleaned_history = []
+
+    for item in energy_history[device_id]:
+
+        try:
+
+            timestamp_text = item.get(
+                "timestamp"
+            )
+
+            if not timestamp_text:
+
+                continue
+
+            timestamp = datetime.fromisoformat(
+                timestamp_text
+            )
+
+            if timestamp.tzinfo is None:
+
+                timestamp = timestamp.replace(
+                    tzinfo=timezone.utc
+                )
+
+            if timestamp >= cutoff_time:
+
+                cleaned_history.append(
+                    item
+                )
+
+        except Exception as e:
+
+            print(
+                "History cleanup error:",
+                e
+            )
+
+    energy_history[device_id] = (
+        cleaned_history
+    )
+
+
+# ==========================================================
+# ADD HISTORY DATA
+# ==========================================================
+
+def add_history(device_id, device):
+
+    ensure_history_storage(
+        device_id
+    )
+
+    timestamp = current_time()
+
+    history_item = {
+
+        "timestamp":
+            timestamp,
+
+        "sensors":
+            device.get(
+                "sensors",
+                {}
+            ),
+
+        "energy":
+            device.get(
+                "energy",
+                {}
+            )
+    }
+
+
+    # Store data only when energy or sensor
+    # information exists
+
+    if (
+        history_item["sensors"]
+        or
+        history_item["energy"]
+    ):
+
+        energy_history[
+            device_id
+        ].append(
+            history_item
+        )
+
+
+    # Remove anything older than 48 hours
+
+    cleanup_history(
+        device_id
+    )
 
 
 # ==========================================================
@@ -64,49 +196,78 @@ def current_time():
 def ensure_command_storage(device_id):
 
     if device_id not in commands:
+
         commands[device_id] = {}
 
 
 def clear_device_commands(device_id):
 
-    ensure_command_storage(device_id)
+    ensure_command_storage(
+        device_id
+    )
 
-    commands[device_id].clear()
+    commands[
+        device_id
+    ].clear()
 
 
 # ==========================================================
 # COMMAND CONTROL NAME
 # ==========================================================
 
-def get_control_from_command(command, data=None):
+def get_control_from_command(
+    command,
+    data=None
+):
 
     data = data or {}
 
+
     # ------------------------------------------------------
-    # NEW GENERIC RELAY COMMAND
+    # GENERIC RELAY COMMAND
     # ------------------------------------------------------
 
-    if command in ["RELAY_ON", "RELAY_OFF"]:
+    if command in [
+        "RELAY_ON",
+        "RELAY_OFF"
+    ]:
 
-        relay_id = data.get("relay")
+        relay_id = data.get(
+            "relay"
+        )
 
         if relay_id is None:
-            relay_id = data.get("channel")
+
+            relay_id = data.get(
+                "channel"
+            )
 
         if relay_id is None:
+
             relay_id = 1
 
-        return "relay_" + str(relay_id)
+
+        return (
+            "relay_"
+            + str(relay_id)
+        )
 
 
     # ------------------------------------------------------
     # OLD COMMANDS
     # ------------------------------------------------------
 
-    if command.startswith("LIGHT_"):
+    if command.startswith(
+        "LIGHT_"
+    ):
+
         return "light"
 
-    if command.startswith("FAN_"):
+
+    if command.startswith(
+        "FAN_"
+    ):
+
         return "fan"
 
 
@@ -117,22 +278,39 @@ def get_control_from_command(command, data=None):
 # COMMAND TIMEOUT CLEANUP
 # ==========================================================
 
-def cleanup_commands(device_id=None):
+def cleanup_commands(
+    device_id=None
+):
 
     now = current_datetime()
 
+
     if device_id is not None:
-        device_ids = [device_id]
+
+        device_ids = [
+            device_id
+        ]
+
     else:
-        device_ids = list(commands.keys())
+
+        device_ids = list(
+            commands.keys()
+        )
 
 
     for current_device_id in device_ids:
 
-        ensure_command_storage(current_device_id)
+        ensure_command_storage(
+            current_device_id
+        )
+
 
         controls = list(
-            commands[current_device_id].keys()
+
+            commands[
+                current_device_id
+            ].keys()
+
         )
 
 
@@ -140,23 +318,31 @@ def cleanup_commands(device_id=None):
 
             item = commands[
                 current_device_id
-            ].get(control)
+            ].get(
+                control
+            )
 
 
             if item is None:
+
                 continue
 
 
             try:
 
-                created_text = item.get("created")
+                created_text = item.get(
+                    "created"
+                )
 
 
                 if not created_text:
 
                     commands[
                         current_device_id
-                    ].pop(control, None)
+                    ].pop(
+                        control,
+                        None
+                    )
 
                     continue
 
@@ -174,36 +360,54 @@ def cleanup_commands(device_id=None):
 
 
                 age = (
-                    now - created
+
+                    now
+                    - created
+
                 ).total_seconds()
 
 
                 if age > COMMAND_TIMEOUT_SECONDS:
 
                     print(
+
                         "Command expired:",
+
                         current_device_id,
+
                         control,
-                        item.get("command")
+
+                        item.get(
+                            "command"
+                        )
                     )
 
 
                     commands[
                         current_device_id
-                    ].pop(control, None)
+                    ].pop(
+                        control,
+                        None
+                    )
 
 
             except Exception as e:
 
                 print(
+
                     "Command cleanup error:",
+
                     e
+
                 )
 
 
                 commands[
                     current_device_id
-                ].pop(control, None)
+                ].pop(
+                    control,
+                    None
+                )
 
 
 # ==========================================================
@@ -221,7 +425,9 @@ def update_online_status(device):
 
         if not last_seen_text:
 
-            device["online"] = False
+            device[
+                "online"
+            ] = False
 
             return False
 
@@ -239,13 +445,18 @@ def update_online_status(device):
 
 
         age = (
-            current_datetime() - last_seen
+
+            current_datetime()
+            - last_seen
+
         ).total_seconds()
 
 
         if age > OFFLINE_TIMEOUT_SECONDS:
 
-            device["online"] = False
+            device[
+                "online"
+            ] = False
 
 
             device_id = device.get(
@@ -263,7 +474,10 @@ def update_online_status(device):
             return False
 
 
-        device["online"] = True
+        device[
+            "online"
+        ] = True
+
 
         return True
 
@@ -276,7 +490,10 @@ def update_online_status(device):
         )
 
 
-        device["online"] = False
+        device[
+            "online"
+        ] = False
+
 
         return False
 
@@ -289,10 +506,14 @@ def update_all_online_status():
 
     with data_lock:
 
-        for device in devices.values():
+        for device_id, device in devices.items():
 
             update_online_status(
                 device
+            )
+
+            cleanup_history(
+                device_id
             )
 
 
@@ -305,14 +526,19 @@ def update_all_online_status():
 
 def normalize_relays(data):
 
-    relays = data.get("relays")
+    relays = data.get(
+        "relays"
+    )
 
 
     # ------------------------------------------------------
     # NEW FORMAT
     # ------------------------------------------------------
 
-    if isinstance(relays, list):
+    if isinstance(
+        relays,
+        list
+    ):
 
         result = []
 
@@ -322,44 +548,65 @@ def normalize_relays(data):
             start=1
         ):
 
-            if isinstance(relay, dict):
+            if isinstance(
+                relay,
+                dict
+            ):
 
                 relay_id = relay.get(
                     "id",
                     index
                 )
 
+
                 name = relay.get(
+
                     "name",
-                    "Relay " + str(relay_id)
+
+                    "Relay "
+                    + str(relay_id)
+
                 )
 
+
                 state = bool(
+
                     relay.get(
                         "state",
                         False
                     )
+
                 )
+
 
             else:
 
                 relay_id = index
 
+
                 name = (
-                    "Relay " +
-                    str(relay_id)
+
+                    "Relay "
+                    + str(relay_id)
+
                 )
 
-                state = bool(relay)
+
+                state = bool(
+                    relay
+                )
 
 
             result.append({
 
-                "id": relay_id,
+                "id":
+                    relay_id,
 
-                "name": name,
+                "name":
+                    name,
 
-                "state": state
+                "state":
+                    state
 
             })
 
@@ -368,31 +615,49 @@ def normalize_relays(data):
 
 
     # ------------------------------------------------------
-    # CURRENT 2-RELAY SYSTEM
+    # CURRENT 2 RELAY SYSTEM
     # ------------------------------------------------------
 
     return [
 
         {
-            "id": 1,
-            "name": "Light",
-            "state": bool(
-                data.get(
-                    "light",
-                    False
+
+            "id":
+                1,
+
+            "name":
+                "Light",
+
+            "state":
+                bool(
+
+                    data.get(
+                        "light",
+                        False
+                    )
+
                 )
-            )
+
         },
 
         {
-            "id": 2,
-            "name": "Fan",
-            "state": bool(
-                data.get(
-                    "fan",
-                    False
+
+            "id":
+                2,
+
+            "name":
+                "Fan",
+
+            "state":
+                bool(
+
+                    data.get(
+                        "fan",
+                        False
+                    )
+
                 )
-            )
+
         }
 
     ]
@@ -419,11 +684,18 @@ def update_relay_state(
 
     for relay in relays:
 
-        if str(relay.get("id")) == str(
-            relay_id
-        ):
+        if str(
+            relay.get(
+                "id"
+            )
+        ) == str(relay_id):
 
-            relay["state"] = bool(state)
+            relay[
+                "state"
+            ] = bool(
+                state
+            )
+
 
             found = True
 
@@ -434,13 +706,16 @@ def update_relay_state(
 
         relays.append({
 
-            "id": relay_id,
+            "id":
+                relay_id,
 
             "name":
-                "Relay " +
-                str(relay_id),
 
-            "state": bool(state)
+                "Relay "
+                + str(relay_id),
+
+            "state":
+                bool(state)
 
         })
 
@@ -451,12 +726,20 @@ def update_relay_state(
 
     if str(relay_id) == "1":
 
-        device["light"] = bool(state)
+        device[
+            "light"
+        ] = bool(
+            state
+        )
 
 
     if str(relay_id) == "2":
 
-        device["fan"] = bool(state)
+        device[
+            "fan"
+        ] = bool(
+            state
+        )
 
 
 # ==========================================================
@@ -477,14 +760,18 @@ def get_relay_state(
     for relay in relays:
 
         if str(
-            relay.get("id")
+            relay.get(
+                "id"
+            )
         ) == str(relay_id):
 
             return bool(
+
                 relay.get(
                     "state",
                     False
                 )
+
             )
 
 
@@ -506,7 +793,11 @@ def confirm_commands_from_state(
 
 
     controls = list(
-        commands[device_id].keys()
+
+        commands[
+            device_id
+        ].keys()
+
     )
 
 
@@ -514,10 +805,13 @@ def confirm_commands_from_state(
 
         item = commands[
             device_id
-        ].get(control)
+        ].get(
+            control
+        )
 
 
         if item is None:
+
             continue
 
 
@@ -536,24 +830,30 @@ def confirm_commands_from_state(
         if control == "light":
 
             state = bool(
+
                 device.get(
                     "light",
                     False
                 )
+
             )
 
 
             if (
+
                 command == "LIGHT_ON"
                 and state
+
             ):
 
                 confirmed = True
 
 
             elif (
+
                 command == "LIGHT_OFF"
                 and not state
+
             ):
 
                 confirmed = True
@@ -566,24 +866,30 @@ def confirm_commands_from_state(
         elif control == "fan":
 
             state = bool(
+
                 device.get(
                     "fan",
                     False
                 )
+
             )
 
 
             if (
+
                 command == "FAN_ON"
                 and state
+
             ):
 
                 confirmed = True
 
 
             elif (
+
                 command == "FAN_OFF"
                 and not state
+
             ):
 
                 confirmed = True
@@ -610,16 +916,20 @@ def confirm_commands_from_state(
 
 
             if (
+
                 command == "RELAY_ON"
                 and state
+
             ):
 
                 confirmed = True
 
 
             elif (
+
                 command == "RELAY_OFF"
                 and not state
+
             ):
 
                 confirmed = True
@@ -632,10 +942,15 @@ def confirm_commands_from_state(
         if confirmed:
 
             print(
+
                 "Command confirmed:",
+
                 device_id,
+
                 control,
+
                 command
+
             )
 
 
@@ -648,7 +963,7 @@ def confirm_commands_from_state(
 
 
 # ==========================================================
-# CREATE / UPDATE DEVICE
+# CREATE DEVICE
 # ==========================================================
 
 def build_device(data):
@@ -661,60 +976,85 @@ def build_device(data):
     device = {
 
         "device_id":
+
             data.get(
                 "device_id"
             ),
 
+
         "type":
+
             data.get(
                 "type",
                 "ESP8266"
             ),
 
+
         "ip":
+
             data.get(
                 "ip",
                 "unknown"
             ),
 
+
         "firmware":
+
             data.get(
                 "firmware",
                 "unknown"
             ),
 
+
         "online":
             True,
 
+
         # ----------------------------------------------
-        # BACKWARD COMPATIBLE
+        # BACKWARD COMPATIBILITY
         # ----------------------------------------------
 
         "light":
+
             bool(
+
                 data.get(
+
                     "light",
+
                     get_relay_state(
                         {
-                            "relays": relays
+                            "relays":
+                                relays
                         },
                         1
                     )
+
                 )
+
             ),
 
+
         "fan":
+
             bool(
+
                 data.get(
+
                     "fan",
+
                     get_relay_state(
                         {
-                            "relays": relays
+                            "relays":
+                                relays
                         },
                         2
                     )
+
                 )
+
             ),
+
 
         # ----------------------------------------------
         # GENERIC RELAYS
@@ -723,28 +1063,34 @@ def build_device(data):
         "relays":
             relays,
 
+
         # ----------------------------------------------
         # SENSORS
         # ----------------------------------------------
 
         "sensors":
+
             data.get(
                 "sensors",
                 {}
             ),
+
 
         # ----------------------------------------------
         # ENERGY
         # ----------------------------------------------
 
         "energy":
+
             data.get(
                 "energy",
                 {}
             ),
 
+
         "last_seen":
             current_time()
+
     }
 
 
@@ -762,21 +1108,27 @@ def update_device_from_data(
 
     if "type" in data:
 
-        device["type"] = data[
+        device[
+            "type"
+        ] = data[
             "type"
         ]
 
 
     if "ip" in data:
 
-        device["ip"] = data[
+        device[
+            "ip"
+        ] = data[
             "ip"
         ]
 
 
     if "firmware" in data:
 
-        device["firmware"] = data[
+        device[
+            "firmware"
+        ] = data[
             "firmware"
         ]
 
@@ -787,8 +1139,10 @@ def update_device_from_data(
 
     if "relays" in data:
 
-        device["relays"] = (
-            normalize_relays(data)
+        device[
+            "relays"
+        ] = normalize_relays(
+            data
         )
 
 
@@ -798,29 +1152,41 @@ def update_device_from_data(
 
     if "light" in data:
 
-        device["light"] = bool(
+        device[
+            "light"
+        ] = bool(
             data["light"]
         )
 
 
         update_relay_state(
+
             device,
+
             1,
+
             data["light"]
+
         )
 
 
     if "fan" in data:
 
-        device["fan"] = bool(
+        device[
+            "fan"
+        ] = bool(
             data["fan"]
         )
 
 
         update_relay_state(
+
             device,
+
             2,
+
             data["fan"]
+
         )
 
 
@@ -830,11 +1196,11 @@ def update_device_from_data(
 
     if "sensors" in data:
 
-        device["sensors"] = (
-            data.get(
-                "sensors",
-                {}
-            )
+        device[
+            "sensors"
+        ] = data.get(
+            "sensors",
+            {}
         )
 
 
@@ -844,26 +1210,32 @@ def update_device_from_data(
 
     if "energy" in data:
 
-        device["energy"] = (
-            data.get(
-                "energy",
-                {}
-            )
+        device[
+            "energy"
+        ] = data.get(
+            "energy",
+            {}
         )
 
 
-    device["online"] = True
+    device[
+        "online"
+    ] = True
 
-    device["last_seen"] = (
-        current_time()
-    )
+
+    device[
+        "last_seen"
+    ] = current_time()
 
 
 # ==========================================================
 # HOME
 # ==========================================================
 
-@app.route("/", methods=["GET"])
+@app.route(
+    "/",
+    methods=["GET"]
+)
 def home():
 
     update_all_online_status()
@@ -878,12 +1250,14 @@ def home():
         if device.get(
             "online"
         ) is True
+
     )
 
 
     return jsonify({
 
-        "success": True,
+        "success":
+            True,
 
         "server":
             "ESP Smart Home Cloud Server",
@@ -898,7 +1272,11 @@ def home():
             len(devices),
 
         "online_devices":
-            online_count
+            online_count,
+
+        "history_hours":
+            HISTORY_HOURS
+
     })
 
 
@@ -924,12 +1302,14 @@ def status():
         if device.get(
             "online"
         ) is True
+
     )
 
 
     return jsonify({
 
-        "success": True,
+        "success":
+            True,
 
         "server":
             "ESP Smart Home Cloud Server",
@@ -944,7 +1324,11 @@ def status():
             len(devices),
 
         "online_devices":
-            online_count
+            online_count,
+
+        "history_hours":
+            HISTORY_HOURS
+
     })
 
 
@@ -967,7 +1351,8 @@ def register():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "No JSON data received"
@@ -984,7 +1369,8 @@ def register():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "device_id is required"
@@ -1000,8 +1386,10 @@ def register():
 
         if device_id not in devices:
 
-            devices[device_id] = (
-                build_device(data)
+            devices[
+                device_id
+            ] = build_device(
+                data
             )
 
 
@@ -1010,8 +1398,15 @@ def register():
             )
 
 
+            ensure_history_storage(
+                device_id
+            )
+
+
             message = (
+
                 "New device registered successfully"
+
             )
 
 
@@ -1038,25 +1433,52 @@ def register():
 
 
             confirm_commands_from_state(
+
                 device_id,
+
                 device
+
             )
 
 
             message = (
+
                 "Existing device updated successfully"
+
             )
+
+
+        device = devices[
+            device_id
+        ]
+
+
+        # --------------------------------------------------
+        # SAVE HISTORY
+        # --------------------------------------------------
+
+        add_history(
+
+            device_id,
+
+            device
+
+        )
 
 
     return jsonify({
 
-        "success": True,
+        "success":
+            True,
 
         "message":
             message,
 
         "device":
-            devices[device_id]
+            devices[
+                device_id
+            ]
+
     })
 
 
@@ -1079,7 +1501,8 @@ def heartbeat():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "No JSON data received"
@@ -1096,7 +1519,8 @@ def heartbeat():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "device_id is required"
@@ -1112,8 +1536,10 @@ def heartbeat():
 
         if device_id not in devices:
 
-            devices[device_id] = (
-                build_device(data)
+            devices[
+                device_id
+            ] = build_device(
+                data
             )
 
 
@@ -1122,9 +1548,17 @@ def heartbeat():
             )
 
 
-            print(
-                "Auto-registered device:",
+            ensure_history_storage(
                 device_id
+            )
+
+
+            print(
+
+                "Auto-registered device:",
+
+                device_id
+
             )
 
 
@@ -1140,8 +1574,11 @@ def heartbeat():
 
 
             update_device_from_data(
+
                 device,
+
                 data
+
             )
 
 
@@ -1151,12 +1588,28 @@ def heartbeat():
 
 
         # --------------------------------------------------
+        # SAVE 48 HOUR GRAPH HISTORY
+        # --------------------------------------------------
+
+        add_history(
+
+            device_id,
+
+            device
+
+        )
+
+
+        # --------------------------------------------------
         # CONFIRM COMMANDS
         # --------------------------------------------------
 
         confirm_commands_from_state(
+
             device_id,
+
             device
+
         )
 
 
@@ -1171,7 +1624,8 @@ def heartbeat():
 
     return jsonify({
 
-        "success": True,
+        "success":
+            True,
 
         "message":
             "Heartbeat received",
@@ -1184,7 +1638,135 @@ def heartbeat():
 
         "device":
             device
+
     })
+
+
+# ==========================================================
+# GET DEVICE HISTORY
+# ==========================================================
+
+@app.route(
+    "/device/<device_id>/history",
+    methods=["GET"]
+)
+def get_device_history(device_id):
+
+    requested_hours = request.args.get(
+        "hours",
+        HISTORY_HOURS,
+        type=int
+    )
+
+
+    if requested_hours is None:
+
+        requested_hours = HISTORY_HOURS
+
+
+    # Maximum allowed history is 48 hours
+
+    requested_hours = max(
+        1,
+        min(
+            requested_hours,
+            HISTORY_HOURS
+        )
+    )
+
+
+    with data_lock:
+
+        if device_id not in devices:
+
+            return jsonify({
+
+                "success":
+                    False,
+
+                "message":
+                    "Device not found"
+
+            }), 404
+
+
+        ensure_history_storage(
+            device_id
+        )
+
+
+        cleanup_history(
+            device_id
+        )
+
+
+        cutoff_time = (
+
+            current_datetime()
+
+            - timedelta(
+                hours=requested_hours
+            )
+
+        )
+
+
+        result = []
+
+
+        for item in energy_history[
+            device_id
+        ]:
+
+            try:
+
+                timestamp_text = item.get(
+                    "timestamp"
+                )
+
+
+                timestamp = datetime.fromisoformat(
+                    timestamp_text
+                )
+
+
+                if timestamp.tzinfo is None:
+
+                    timestamp = timestamp.replace(
+                        tzinfo=timezone.utc
+                    )
+
+
+                if timestamp >= cutoff_time:
+
+                    result.append(
+                        item
+                    )
+
+
+            except Exception:
+
+                continue
+
+
+        return jsonify({
+
+            "success":
+                True,
+
+            "device_id":
+                device_id,
+
+            "hours":
+                requested_hours,
+
+            "count":
+                len(result),
+
+            "history":
+                result
+
+        })
 
 
 # ==========================================================
@@ -1211,12 +1793,14 @@ def get_devices():
             if device.get(
                 "online"
             ) is True
+
         )
 
 
         return jsonify({
 
-            "success": True,
+            "success":
+                True,
 
             "count":
                 len(devices),
@@ -1228,6 +1812,7 @@ def get_devices():
                 list(
                     devices.values()
                 )
+
         })
 
 
@@ -1247,7 +1832,8 @@ def get_device(device_id):
 
             return jsonify({
 
-                "success": False,
+                "success":
+                    False,
 
                 "message":
                     "Device not found"
@@ -1270,12 +1856,19 @@ def get_device(device_id):
         )
 
 
+        cleanup_history(
+            device_id
+        )
+
+
         return jsonify({
 
-            "success": True,
+            "success":
+                True,
 
             "device":
                 device
+
         })
 
 
@@ -1298,7 +1891,8 @@ def send_command():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "No JSON data received"
@@ -1320,7 +1914,8 @@ def send_command():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "device_id is required"
@@ -1332,7 +1927,8 @@ def send_command():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "command is required"
@@ -1350,6 +1946,7 @@ def send_command():
 
         "RELAY_ON",
         "RELAY_OFF"
+
     ]
 
 
@@ -1357,7 +1954,8 @@ def send_command():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "Invalid command"
@@ -1366,8 +1964,11 @@ def send_command():
 
 
     control = get_control_from_command(
+
         command,
+
         data
+
     )
 
 
@@ -1375,7 +1976,8 @@ def send_command():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "Invalid control"
@@ -1389,7 +1991,8 @@ def send_command():
 
             return jsonify({
 
-                "success": False,
+                "success":
+                    False,
 
                 "message":
                     "Device not found"
@@ -1412,7 +2015,8 @@ def send_command():
 
             return jsonify({
 
-                "success": False,
+                "success":
+                    False,
 
                 "message":
                     "Device is offline",
@@ -1442,7 +2046,9 @@ def send_command():
 
         commands[
             device_id
-        ][control] = {
+        ][
+            control
+        ] = {
 
             "command":
                 command,
@@ -1452,20 +2058,27 @@ def send_command():
 
             "delivered":
                 False
+
         }
 
 
         print(
+
             "Command queued:",
+
             device_id,
+
             control,
+
             command
+
         )
 
 
     return jsonify({
 
-        "success": True,
+        "success":
+            True,
 
         "message":
             "Command queued",
@@ -1481,6 +2094,7 @@ def send_command():
 
         "online":
             True
+
     })
 
 
@@ -1503,7 +2117,8 @@ def get_command():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "device_id is required"
@@ -1517,7 +2132,8 @@ def get_command():
 
             return jsonify({
 
-                "success": False,
+                "success":
+                    False,
 
                 "message":
                     "Device not found"
@@ -1530,17 +2146,14 @@ def get_command():
         ]
 
 
-        # --------------------------------------------------
-        # CHECK ONLINE
-        # --------------------------------------------------
-
         if not update_online_status(
             device
         ):
 
             return jsonify({
 
-                "success": False,
+                "success":
+                    False,
 
                 "device_id":
                     device_id,
@@ -1567,20 +2180,14 @@ def get_command():
         )
 
 
-        # --------------------------------------------------
-        # FIND FIRST AVAILABLE COMMAND
-        # --------------------------------------------------
-
         selected_control = None
 
         selected_item = None
 
 
-        for control, item in (
-            commands[
-                device_id
-            ].items()
-        ):
+        for control, item in commands[
+            device_id
+        ].items():
 
             if item is not None:
 
@@ -1599,7 +2206,8 @@ def get_command():
 
             return jsonify({
 
-                "success": True,
+                "success":
+                    True,
 
                 "device_id":
                     device_id,
@@ -1609,6 +2217,7 @@ def get_command():
 
                 "command":
                     None
+
             })
 
 
@@ -1621,24 +2230,28 @@ def get_command():
         ] = True
 
 
-        current_command = (
-            selected_item[
-                "command"
-            ]
-        )
+        current_command = selected_item[
+            "command"
+        ]
 
 
         print(
+
             "Command delivered:",
+
             device_id,
+
             selected_control,
+
             current_command
+
         )
 
 
         response = {
 
-            "success": True,
+            "success":
+                True,
 
             "device_id":
                 device_id,
@@ -1651,6 +2264,7 @@ def get_command():
 
             "control":
                 selected_control
+
         }
 
 
@@ -1662,11 +2276,9 @@ def get_command():
             "relay_"
         ):
 
-            relay_id = (
-                selected_control.replace(
-                    "relay_",
-                    ""
-                )
+            relay_id = selected_control.replace(
+                "relay_",
+                ""
             )
 
 
@@ -1675,7 +2287,9 @@ def get_command():
             ] = relay_id
 
 
-        return jsonify(response)
+        return jsonify(
+            response
+        )
 
 
 # ==========================================================
@@ -1697,7 +2311,8 @@ def command_status():
 
         return jsonify({
 
-            "success": False,
+            "success":
+                False,
 
             "message":
                 "device_id is required"
@@ -1711,7 +2326,8 @@ def command_status():
 
             return jsonify({
 
-                "success": False,
+                "success":
+                    False,
 
                 "message":
                     "Device not found"
@@ -1732,11 +2348,9 @@ def command_status():
         result = {}
 
 
-        for control, item in (
-            commands[
-                device_id
-            ].items()
-        ):
+        for control, item in commands[
+            device_id
+        ].items():
 
             if item is None:
 
@@ -1751,32 +2365,38 @@ def command_status():
                 ] = {
 
                     "command":
+
                         item.get(
                             "command"
                         ),
 
                     "created":
+
                         item.get(
                             "created"
                         ),
 
                     "delivered":
+
                         item.get(
                             "delivered",
                             False
                         )
+
                 }
 
 
         return jsonify({
 
-            "success": True,
+            "success":
+                True,
 
             "device_id":
                 device_id,
 
             "commands":
                 result
+
         })
 
 
@@ -1796,7 +2416,8 @@ def mark_offline(device_id):
 
             return jsonify({
 
-                "success": False,
+                "success":
+                    False,
 
                 "message":
                     "Device not found"
@@ -1806,7 +2427,9 @@ def mark_offline(device_id):
 
         devices[
             device_id
-        ]["online"] = False
+        ][
+            "online"
+        ] = False
 
 
         clear_device_commands(
@@ -1816,18 +2439,20 @@ def mark_offline(device_id):
 
         return jsonify({
 
-            "success": True,
+            "success":
+                True,
 
             "message":
                 "Device marked offline",
 
             "device_id":
                 device_id
+
         })
 
 
 # ==========================================================
-# RESET DEVICE COMMANDS
+# CLEAR DEVICE COMMANDS
 # ==========================================================
 
 @app.route(
@@ -1842,7 +2467,8 @@ def clear_commands(device_id):
 
             return jsonify({
 
-                "success": False,
+                "success":
+                    False,
 
                 "message":
                     "Device not found"
@@ -1857,13 +2483,15 @@ def clear_commands(device_id):
 
         return jsonify({
 
-            "success": True,
+            "success":
+                True,
 
             "message":
                 "All commands cleared",
 
             "device_id":
                 device_id
+
         })
 
 
@@ -1879,6 +2507,7 @@ if __name__ == "__main__":
             "PORT",
             5000
         )
+
     )
 
 
@@ -1891,7 +2520,7 @@ if __name__ == "__main__":
     )
 
     print(
-        " VERSION 3.0"
+        " VERSION 3.1"
     )
 
     print(
@@ -1919,10 +2548,17 @@ if __name__ == "__main__":
         "seconds"
     )
 
+    print(
+        "History storage:",
+        HISTORY_HOURS,
+        "hours"
+    )
+
 
     app.run(
 
         host="0.0.0.0",
 
         port=port
+
     )
